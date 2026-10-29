@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
  *
- * (C) COPYRIGHT 2019-2020 ARM Limited. All rights reserved.
+ * (C) COPYRIGHT 2019-2023 ARM Limited. All rights reserved.
  *
  * This program is free software and is provided to you under the terms of the
  * GNU General Public License version 2 as published by the Free Software
@@ -24,6 +24,12 @@
 /*
  * Base kernel context APIs
  */
+#include <linux/version.h>
+#if KERNEL_VERSION(4, 11, 0) <= LINUX_VERSION_CODE
+#include <linux/sched/task.h>
+#else
+#include <linux/sched.h>
+#endif
 
 #include <mali_kbase.h>
 #include <gpu/mali_kbase_gpu_regmap.h>
@@ -31,7 +37,6 @@
 #include <mali_kbase_dma_fence.h>
 #include <mali_kbase_ctx_sched.h>
 #include <mali_kbase_mem_pool_group.h>
-#include <tl/mali_kbase_tracepoints.h>
 #include <tl/mali_kbase_timeline.h>
 #include <mmu/mali_kbase_mmu.h>
 #include <context/mali_kbase_context_internal.h>
@@ -133,16 +138,49 @@ int kbase_context_common_init(struct kbase_context *kctx)
 	/* creating a context is considered a disjoint event */
 	kbase_disjoint_event(kctx->kbdev);
 
-	kctx->as_nr = KBASEP_AS_NR_INVALID;
-
-	atomic_set(&kctx->refcount, 0);
-
-	spin_lock_init(&kctx->mm_update_lock);
 	kctx->process_mm = NULL;
+	kctx->task = NULL;
 	atomic_set(&kctx->nonmapped_pages, 0);
 	atomic_set(&kctx->permanent_mapped_pages, 0);
 	kctx->tgid = current->tgid;
 	kctx->pid = current->pid;
+
+	/* Check if this is a Userspace created context */
+	if (likely(kctx->filp)) {
+		struct pid *pid_struct;
+
+		rcu_read_lock();
+		pid_struct = find_get_pid(kctx->tgid);
+		if (likely(pid_struct)) {
+			struct task_struct *task = pid_task(pid_struct, PIDTYPE_PID);
+
+			if (likely(task)) {
+				/* Take a reference on the task to avoid slow lookup
+				 * later on from the page allocation loop.
+				 */
+				get_task_struct(task);
+				kctx->task = task;
+			} else {
+				dev_err(kctx->kbdev->dev,
+					"Failed to get task pointer for %s/%d",
+					current->comm, current->pid);
+				err = -ESRCH;
+			}
+
+			put_pid(pid_struct);
+		} else {
+			dev_err(kctx->kbdev->dev,
+				"Failed to get pid pointer for %s/%d",
+				current->comm, current->pid);
+			err = -ESRCH;
+		}
+		rcu_read_unlock();
+
+		if (unlikely(err))
+			return err;
+                kbase_mem_mmgrab();
+                kctx->process_mm = current->mm;
+	}
 
 	atomic_set(&kctx->used_pages, 0);
 
@@ -169,20 +207,50 @@ int kbase_context_common_init(struct kbase_context *kctx)
 	mutex_init(&kctx->legacy_hwcnt_lock);
 
 	mutex_lock(&kctx->kbdev->kctx_list_lock);
-	list_add(&kctx->kctx_list_link, &kctx->kbdev->kctx_list);
-
 	err = kbase_insert_kctx_to_process(kctx);
-	if (err)
-		dev_err(kctx->kbdev->dev,
-		"(err:%d) failed to insert kctx to kbase_process\n", err);
-
-	KBASE_TLSTREAM_TL_KBASE_NEW_CTX(kctx->kbdev, kctx->id,
-		kctx->kbdev->gpu_props.props.raw_props.gpu_id);
-	KBASE_TLSTREAM_TL_NEW_CTX(kctx->kbdev, kctx, kctx->id,
-			(u32)(kctx->tgid));
 	mutex_unlock(&kctx->kbdev->kctx_list_lock);
+	if (err) {
+		dev_err(kctx->kbdev->dev,
+			"(err:%d) failed to insert kctx to kbase_process", err);
+		if (likely(kctx->filp)) {
+                        mmdrop(kctx->process_mm);
+                        put_task_struct(kctx->task);
+                }
+        }
 
 	return err;
+}
+
+int kbase_context_add_to_dev_list(struct kbase_context *kctx)
+{
+	if (WARN_ON(!kctx))
+		return -EINVAL;
+
+	if (WARN_ON(!kctx->kbdev))
+		return -EINVAL;
+
+	mutex_lock(&kctx->kbdev->kctx_list_lock);
+	list_add(&kctx->kctx_list_link, &kctx->kbdev->kctx_list);
+	mutex_unlock(&kctx->kbdev->kctx_list_lock);
+
+	kbase_timeline_post_kbase_context_create(kctx);
+
+	return 0;
+}
+
+void kbase_context_remove_from_dev_list(struct kbase_context *kctx)
+{
+	if (WARN_ON(!kctx))
+		return;
+
+	if (WARN_ON(!kctx->kbdev))
+		return;
+
+	kbase_timeline_pre_kbase_context_destroy(kctx);
+
+	mutex_lock(&kctx->kbdev->kctx_list_lock);
+	list_del_init(&kctx->kctx_list_link);
+	mutex_unlock(&kctx->kbdev->kctx_list_lock);
 }
 
 /**
@@ -219,14 +287,7 @@ static void kbase_remove_kctx_from_process(struct kbase_context *kctx)
 
 void kbase_context_common_term(struct kbase_context *kctx)
 {
-	unsigned long flags;
 	int pages;
-
-	mutex_lock(&kctx->kbdev->mmu_hw_mutex);
-	spin_lock_irqsave(&kctx->kbdev->hwaccess_lock, flags);
-	kbase_ctx_sched_remove_ctx(kctx);
-	spin_unlock_irqrestore(&kctx->kbdev->hwaccess_lock, flags);
-	mutex_unlock(&kctx->kbdev->mmu_hw_mutex);
 
 	pages = atomic_read(&kctx->used_pages);
 	if (pages != 0)
@@ -237,24 +298,12 @@ void kbase_context_common_term(struct kbase_context *kctx)
 
 	mutex_lock(&kctx->kbdev->kctx_list_lock);
 	kbase_remove_kctx_from_process(kctx);
-
-	KBASE_TLSTREAM_TL_KBASE_DEL_CTX(kctx->kbdev, kctx->id);
-
-	KBASE_TLSTREAM_TL_DEL_CTX(kctx->kbdev, kctx);
-	list_del(&kctx->kctx_list_link);
 	mutex_unlock(&kctx->kbdev->kctx_list_lock);
-
+        if (likely(kctx->filp)) {
+                mmdrop(kctx->process_mm);
+                put_task_struct(kctx->task);
+        }
 	KBASE_KTRACE_ADD(kctx->kbdev, CORE_CTX_DESTROY, kctx, kctx->tgid);
-
-	/* Flush the timeline stream, so the user can see the termination
-	 * tracepoints being fired.
-	 * The "if" statement below is for optimization. It is safe to call
-	 * kbase_timeline_streams_flush when timeline is disabled.
-	 */
-	if (atomic_read(&kctx->kbdev->timeline_flags) != 0)
-		kbase_timeline_streams_flush(kctx->kbdev->timeline);
-
-	vfree(kctx);
 }
 
 int kbase_context_mem_pool_group_init(struct kbase_context *kctx)

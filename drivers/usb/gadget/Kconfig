@@ -147,15 +147,6 @@ config USB_ANDROID_SAMSUNG_COMPOSITE
 	help
 	   Provides SAMSUNG composite driver.
 
-config USB_ANDROID_SAMSUNG_MTP
-	bool "Samsung MTP function"
-	depends on USB_G_ANDROID && !SEC_FACTORY
-	help
-	  Provides Media Transfer Protocol (MTP) support
-	  for samsung gadget driver.
-	  If you enable this option,
-	  google mtp will be changed to samsung mtp.
-
 config USB_DUN_SUPPORT
 	bool "DUN support function"
 	depends on USB_ANDROID_SAMSUNG_COMPOSITE
@@ -262,6 +253,9 @@ config USB_F_SIMMIAN
 	tristate
 
 config USB_F_CONN_GADGET
+	tristate
+
+config USB_F_SS_MON_GADGET
 	tristate
 
 # this first set of drivers all depend on bulk-capable hardware.
@@ -466,6 +460,14 @@ config USB_CONFIGFS_F_CONN_GADGET
         select USB_F_CONN_GADGET
         help
           SydeSync
+
+config USB_CONFIGFS_F_SS_MON_GADGET
+	bool "F_SAMSUNG gadget"
+	depends on USB_CONFIGFS
+	select USB_F_SS_MON_GADGET
+	help
+	 Driver for control to Samsung Usb device layer
+	 For Samung working scenario and saving debug log, etc
 
 config USB_CONFIGFS_F_ACC
 	bool "Accessory gadget"
